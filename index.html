@@ -970,153 +970,123 @@ function showLoading(on) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  DOWNLOAD ENGINE — cascading fallback across 3 live services
+//  DOWNLOAD ENGINE
 //
-//  1. rapidapi-based yt-download (via allorigins CORS proxy)
-//  2. y2down.cc redirect (reliable human-usable page, pre-filled)
-//  3. savefrom.net (universal fallback, always works)
+//  Uses loader.to — a free, no-key-required conversion API
+//  that is purpose-built for YouTube → MP4/MP3 downloads.
 //
-//  The strategy: try to get a direct URL silently; if anything
-//  fails, open a pre-filled download page in a new tab so the
-//  user can complete it with one click — never a dead end.
+//  Flow:
+//   1. POST to loader.to/api/convert  → get a token
+//   2. Poll loader.to/api/get?id=TOKEN until status=200
+//   3. Receive direct .mp4 or .mp3 download URL → trigger it
+//
+//  If loader.to fails for any reason → open a pre-filled
+//  ssyoutube / y2mate page (guaranteed 1-click download).
 // ─────────────────────────────────────────────────────────────
 
-// Quality label map used when opening fallback pages
-const Q_LABEL = { '1080':'1080p', '720':'720p', '480':'480p', '360':'360p', '128':'mp3' };
+// loader.to format IDs  (18=360p mp4, 22=720p mp4, 137=1080p video-only, 140=mp3/m4a)
+const LOADER_FORMATS = {
+  '1080': '137',   // best video — note: audio-only on some videos, merged on others
+  '720':  '22',    // 720p mp4 with audio (most compatible)
+  '480':  '135',   // 480p video
+  '360':  '18',    // 360p mp4 with audio
+  '128':  '140',   // mp3/m4a audio
+};
 
-/**
- * Try the yt-dlp-api (self-hosted open instance) via a public proxy.
- * Returns a direct download URL string or throws.
- */
-async function tryYtDlpApi(videoId, quality, isAudio) {
-  // Public yt-dlp REST API instances — try in order
-  const instances = [
-    `https://yt-dlp-api.fly.dev`,
-    `https://ytdl.fly.dev`,
-  ];
-  const format = isAudio ? 'bestaudio[ext=m4a]/bestaudio' : `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}]`;
-  const ytUrl  = encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`);
+async function tryLoaderTo(videoId, quality, isAudio) {
+  const fmt   = isAudio ? '140' : (LOADER_FORMATS[quality] || '22');
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  for (const base of instances) {
-    try {
-      const res = await fetch(`${base}/api/info?url=${ytUrl}&format=${encodeURIComponent(format)}`, {
-        signal: AbortSignal.timeout(7000),
-      });
-      if (!res.ok) continue;
-      const d = await res.json();
-      const url = d?.url || d?.formats?.[0]?.url;
-      if (url && url.startsWith('http')) return url;
-    } catch { /* try next */ }
+  // Step 1 — request conversion
+  const convertRes = await fetch(
+    `https://loader.to/api/button/?url=${encodeURIComponent(ytUrl)}&f=${fmt}`,
+    { signal: AbortSignal.timeout(10000) }
+  );
+  if (!convertRes.ok) throw new Error('loader.to convert failed: ' + convertRes.status);
+  const convertData = await convertRes.json();
+
+  // loader.to returns { success, id, ... }
+  const token = convertData?.id;
+  if (!token) throw new Error('no token from loader.to');
+
+  // Step 2 — poll until ready (up to 30 s)
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    const pollRes = await fetch(
+      `https://loader.to/api/get?id=${token}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!pollRes.ok) continue;
+    const poll = await pollRes.json();
+
+    // poll returns { success, download_url, progress, ... }
+    if (poll?.download_url && poll.download_url.startsWith('http')) {
+      return poll.download_url;
+    }
+    // also check top-level url field some versions return
+    if (poll?.url && poll.url.startsWith('http')) return poll.url;
   }
-  throw new Error('yt-dlp instances unavailable');
+  throw new Error('loader.to timed out');
 }
 
-/**
- * Try the cobalt.tools API (well-known open-source service).
- * cobalt v10+ uses /api endpoint with this body schema.
- */
-async function tryCobalt(videoId, quality, isAudio) {
-  const endpoints = [
-    'https://api.cobalt.tools/api/json',    // legacy v9
-    'https://co.wuk.sh/api/json',           // community mirror
-  ];
-  const body = JSON.stringify({
-    url: `https://www.youtube.com/watch?v=${videoId}`,
-    vQuality: quality,
-    aFormat:  'mp3',
-    isAudioOnly: isAudio,
-    isNoTTWatermark: true,
-    dubLang: false,
-  });
-  for (const ep of endpoints) {
-    try {
-      const res = await fetch(ep, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body,
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!res.ok) continue;
-      const d = await res.json();
-      if (d.status === 'error' || d.status === 'rate-limit') continue;
-      const url = d.url || (d.status === 'picker' && d.picker?.[0]?.url);
-      if (url && url.startsWith('http')) return url;
-    } catch { /* try next */ }
-  }
-  throw new Error('cobalt unavailable');
+// ── Guaranteed fallback — opens a working page in a new tab ──
+function openFallbackPage(videoId, isAudio) {
+  // ssyoutube trick: just swap "youtube.com" → "ssyoutube.com"
+  // This drops the user onto the SaveFrom download page pre-filled.
+  const url = isAudio
+    ? `https://www.y2mate.com/youtube-mp3/${videoId}`
+    : `https://www.ssyoutube.com/watch?v=${videoId}`;
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 
-/**
- * Build a pre-filled URL for a human-usable download site.
- * These are guaranteed to work because the user completes the
- * final step themselves — no API dependency.
- * Uses ssyoutube.com trick: replacing "youtube" with "ssyoutube"
- * in the URL opens the SaveFrom download page pre-filled.
- */
-function buildFallbackPage(videoId, isAudio, quality) {
-  if (isAudio) {
-    return `https://www.y2mate.com/youtube-mp3/${videoId}`;
-  }
-  // ssyoutube is the most reliable 1-click redirect trick
-  return `https://www.ssyoutube.com/watch?v=${videoId}`;
+function triggerDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href     = url;
+  a.download = filename || 'tubesnap-download';
+  a.target   = '_blank';
+  a.rel      = 'noopener noreferrer';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => document.body.removeChild(a), 300);
 }
 
 async function handleFormatClick(e) {
   const btn     = e.currentTarget;
   const videoId = btn.dataset.videoId;
-  const quality = btn.dataset.quality;  // "1080","720","480","360","128"
+  const quality = btn.dataset.quality;
   const isAudio = btn.dataset.type === 'audio';
+  const label   = btn.querySelector('.format-label')?.textContent || quality;
 
-  // Show spinner on button
+  // Disable all format buttons and show spinner on clicked one
+  const allBtns = formatGrid.querySelectorAll('.format-btn');
+  allBtns.forEach(b => { b.style.pointerEvents = 'none'; b.style.opacity = '0.5'; });
   const orig = btn.innerHTML;
-  btn.innerHTML = `<span class="spinner" style="width:14px;height:14px;border-width:2px;margin-bottom:4px;"></span><span class="format-label" style="margin-top:0;font-size:0.78rem">Please wait…</span>`;
-  btn.style.pointerEvents = 'none';
-  setStatus('⏳ Preparing your download link…', 'loading');
+  btn.style.opacity = '1';
+  btn.innerHTML = `
+    <span class="spinner" style="width:16px;height:16px;border-width:2px;margin-bottom:2px;"></span>
+    <span class="format-label" style="font-size:0.75rem">Converting…</span>
+    <span class="format-sub">please wait</span>
+  `;
+  setStatus(`⏳ Converting to ${label}… this takes ~10–20 seconds.`, 'loading');
 
-  let downloaded = false;
-
-  // ── Attempt 1: cobalt ──
   try {
-    const dlUrl = await tryCobalt(videoId, quality, isAudio);
-    triggerDownload(dlUrl);
+    const dlUrl = await tryLoaderTo(videoId, quality, isAudio);
+    const ext   = isAudio ? 'mp3' : 'mp4';
+    triggerDownload(dlUrl, `tubesnap-${videoId}.${ext}`);
     setStatus('✅ Download started! Check your downloads folder.', '');
-    downloaded = true;
-  } catch(e1) {
-    console.info('cobalt failed:', e1.message);
+    btn.innerHTML = `<span class="format-icon">✅</span><span class="format-label">${label}</span><span class="format-sub">Download started</span>`;
+  } catch (err) {
+    console.warn('loader.to failed, opening fallback:', err.message);
+    openFallbackPage(videoId, isAudio);
+    setStatus('↗ Download page opened in a new tab — click the Download button there.', '');
+    btn.innerHTML = orig;
+  } finally {
+    setTimeout(() => {
+      allBtns.forEach(b => { b.style.pointerEvents = ''; b.style.opacity = ''; });
+      // restore original button look after 3s
+      setTimeout(() => { try { btn.innerHTML = orig; } catch{} }, 3000);
+    }, 500);
   }
-
-  // ── Attempt 2: yt-dlp API instances ──
-  if (!downloaded) {
-    try {
-      const dlUrl = await tryYtDlpApi(videoId, quality, isAudio);
-      triggerDownload(dlUrl);
-      setStatus('✅ Download started! Check your downloads folder.', '');
-      downloaded = true;
-    } catch(e2) {
-      console.info('yt-dlp instances failed:', e2.message);
-    }
-  }
-
-  // ── Attempt 3: open a pre-filled human download page ──
-  if (!downloaded) {
-    const fallback = buildFallbackPage(videoId, isAudio, quality);
-    window.open(fallback, '_blank', 'noopener,noreferrer');
-    setStatus('↗ Download page opened in a new tab — click Download there.', '');
-  }
-
-  btn.innerHTML = orig;
-  btn.style.pointerEvents = '';
-}
-
-function triggerDownload(url) {
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = '';
-  a.target = '_blank';
-  a.rel = 'noopener noreferrer';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
 }
 
 function renderFormats(videoId) {
