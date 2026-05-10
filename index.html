@@ -360,8 +360,10 @@
       color: var(--text);
       font-family: 'DM Sans', sans-serif;
       text-decoration: none;
+      -webkit-appearance: none;
     }
     .format-btn:hover { border-color: var(--accent); background: rgba(230,57,70,0.07); transform: translateY(-2px); }
+    .format-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .format-label {
       font-family: 'Syne', sans-serif;
       font-weight: 700;
@@ -605,7 +607,7 @@
 <main>
 <section class="hero" aria-labelledby="hero-title">
   <div class="container">
-    <div class="hero-tag">⚡ No signup · No software · 100% Free</div>
+    <div class="hero-tag">⚡ Supports Videos &amp; Shorts · No signup · 100% Free</div>
     <h1 id="hero-title">
       Download Any<br /><em>YouTube Video</em><br />in Seconds
     </h1>
@@ -618,7 +620,7 @@
           class="url-input"
           type="url"
           id="ytUrl"
-          placeholder="Paste YouTube video link here… e.g. https://www.youtube.com/watch?v=..."
+          placeholder="Paste YouTube link here… works with videos, Shorts &amp; youtu.be links"
           aria-label="YouTube video URL"
           autocomplete="off"
           spellcheck="false"
@@ -909,25 +911,57 @@ document.getElementById('pasteBtn').addEventListener('click', async () => {
   }
 });
 
-// ── Downloader Logic ──
-const snapBtn  = document.getElementById('snapBtn');
-const snapText = document.getElementById('snapBtnText');
-const urlInput = document.getElementById('ytUrl');
-const statusEl = document.getElementById('statusMsg');
-const resultBox= document.getElementById('resultBox');
+// ── Core helpers ──
+const snapBtn   = document.getElementById('snapBtn');
+const snapText  = document.getElementById('snapBtnText');
+const urlInput  = document.getElementById('ytUrl');
+const statusEl  = document.getElementById('statusMsg');
+const resultBox = document.getElementById('resultBox');
 const formatGrid= document.getElementById('formatGrid');
 
-function extractVideoId(url) {
+/**
+ * Extracts a YouTube video ID from any known URL format:
+ *  - https://www.youtube.com/watch?v=ID
+ *  - https://youtu.be/ID
+ *  - https://youtube.com/shorts/ID
+ *  - https://www.youtube.com/embed/ID
+ *  - https://m.youtube.com/watch?v=ID
+ */
+function extractVideoId(raw) {
   try {
+    // Strip leading/trailing whitespace and common app-share suffixes
+    const url = raw.trim();
     const u = new URL(url);
-    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1).split('?')[0];
-    return u.searchParams.get('v');
+    const host = u.hostname.replace('www.', '').replace('m.', '');
+
+    if (host === 'youtu.be') {
+      // https://youtu.be/ID?si=...
+      return u.pathname.slice(1).split('?')[0].split('/')[0] || null;
+    }
+
+    if (host === 'youtube.com') {
+      // /shorts/ID
+      if (u.pathname.startsWith('/shorts/')) {
+        return u.pathname.replace('/shorts/', '').split('?')[0].split('/')[0] || null;
+      }
+      // /embed/ID
+      if (u.pathname.startsWith('/embed/')) {
+        return u.pathname.replace('/embed/', '').split('?')[0].split('/')[0] || null;
+      }
+      // /watch?v=ID  or  /live/ID
+      if (u.pathname.startsWith('/live/')) {
+        return u.pathname.replace('/live/', '').split('?')[0].split('/')[0] || null;
+      }
+      // standard watch
+      return u.searchParams.get('v') || null;
+    }
+    return null;
   } catch { return null; }
 }
 
-function setStatus(msg, type='') {
+function setStatus(msg, type = '') {
   statusEl.textContent = msg;
-  statusEl.className = 'status-msg' + (type ? ' '+type : '');
+  statusEl.className = 'status-msg' + (type ? ' ' + type : '');
 }
 
 function showLoading(on) {
@@ -935,45 +969,118 @@ function showLoading(on) {
   snapText.innerHTML = on ? '<span class="spinner"></span> Fetching…' : '⚡ Snap It';
 }
 
-function buildDownloadUrl(videoId, format, quality) {
-  // Uses a common public API proxy approach
-  // In production, connect to your backend/API service
-  const base = `https://www.y2mate.com/mates/analyzeV2/ajax`;
-  return `#download-${videoId}-${format}-${quality}`;
+// ─────────────────────────────────────────────────────────────
+//  DOWNLOAD LINK STRATEGY
+//
+//  We use cobalt.tools public API (open-source, no key needed)
+//  to get a real direct download stream URL for the video.
+//  cobalt handles both regular videos AND YouTube Shorts.
+//
+//  Fallback: if cobalt is unavailable we redirect to
+//  yt1s.com which is a reliable human-usable page.
+// ─────────────────────────────────────────────────────────────
+
+const COBALT_API = 'https://api.cobalt.tools/';
+
+async function getCobaltUrl(videoId, quality, isAudio) {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const body = {
+    url: ytUrl,
+    videoQuality: quality,       // "1080", "720", "480", "360"
+    audioFormat: 'mp3',
+    downloadMode: isAudio ? 'audio' : 'auto',
+    filenameStyle: 'basic',
+  };
+
+  const res = await fetch(COBALT_API, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) throw new Error('cobalt response ' + res.status);
+  const data = await res.json();
+
+  // cobalt returns { status: "stream"|"redirect"|"picker"|"error", url, ... }
+  if (data.status === 'error') throw new Error(data.error?.code || 'cobalt error');
+  if (data.url) return data.url;
+  if (data.status === 'picker' && data.picker?.[0]?.url) return data.picker[0].url;
+  throw new Error('no url in cobalt response');
 }
 
-function renderFormats(videoId, title) {
+// Fallback: open yt1s which lets the user download manually
+function fallbackUrl(videoId, isAudio) {
+  return isAudio
+    ? `https://yt1s.com/youtube-to-mp3?q=https://www.youtube.com/watch?v=${videoId}`
+    : `https://yt1s.com/youtube-to-mp4?q=https://www.youtube.com/watch?v=${videoId}`;
+}
+
+async function handleFormatClick(e) {
+  const btn = e.currentTarget;
+  const videoId = btn.dataset.videoId;
+  const quality  = btn.dataset.quality;
+  const isAudio  = btn.dataset.type === 'audio';
+
+  // Immediately show a loading state on the button
+  const orig = btn.innerHTML;
+  btn.innerHTML = `<span class="spinner" style="width:14px;height:14px;border-width:2px;"></span><span class="format-label" style="margin-top:0">Getting link…</span>`;
+  btn.style.pointerEvents = 'none';
+
+  try {
+    const dlUrl = await getCobaltUrl(videoId, quality, isAudio);
+    // Trigger download by creating a temporary <a> and clicking it
+    const a = document.createElement('a');
+    a.href = dlUrl;
+    a.download = '';            // browser sets filename from Content-Disposition
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setStatus('✅ Download started! Check your downloads folder.', '');
+  } catch (err) {
+    console.warn('cobalt failed, opening fallback:', err);
+    // Open a reliable fallback page in a new tab
+    window.open(fallbackUrl(videoId, isAudio), '_blank', 'noopener,noreferrer');
+    setStatus('↗ Opened download page — choose your quality there.', '');
+  } finally {
+    btn.innerHTML = orig;
+    btn.style.pointerEvents = '';
+  }
+}
+
+function renderFormats(videoId) {
   const formats = [
-    { label: '1080p HD', sub: 'MP4 Video', icon: '📹', type: 'video', quality: '1080p', cls: '' },
-    { label: '720p HD',  sub: 'MP4 Video', icon: '📹', type: 'video', quality: '720p',  cls: '' },
-    { label: '480p SD',  sub: 'MP4 Video', icon: '📹', type: 'video', quality: '480p',  cls: '' },
-    { label: '360p',     sub: 'MP4 Video', icon: '📹', type: 'video', quality: '360p',  cls: '' },
-    { label: 'MP3',      sub: 'Audio Only',icon: '🎵', type: 'audio', quality: '128k',  cls: 'mp3-btn' },
+    { label: '1080p HD', sub: 'MP4 · Best Quality', icon: '📹', type: 'video', quality: '1080', cls: '' },
+    { label: '720p HD',  sub: 'MP4 · High Quality',  icon: '📹', type: 'video', quality: '720',  cls: '' },
+    { label: '480p SD',  sub: 'MP4 · Standard',      icon: '📹', type: 'video', quality: '480',  cls: '' },
+    { label: '360p',     sub: 'MP4 · Small File',     icon: '📹', type: 'video', quality: '360',  cls: '' },
+    { label: 'MP3',      sub: 'Audio Only · 128kbps', icon: '🎵', type: 'audio', quality: '128',  cls: 'mp3-btn' },
   ];
+
   formatGrid.innerHTML = formats.map(f => `
-    <a
-      href="https://api.vevioz.com/@api/button/mp4/${videoId}"
-      target="_blank"
-      rel="noopener noreferrer"
+    <button
       class="format-btn ${f.cls}"
       aria-label="Download ${f.label} ${f.sub}"
+      data-video-id="${videoId}"
       data-quality="${f.quality}"
       data-type="${f.type}"
     >
       <span class="format-icon" aria-hidden="true">${f.icon}</span>
       <span class="format-label">${f.label}</span>
       <span class="format-sub">${f.sub}</span>
-    </a>
+    </button>
   `).join('');
 
-  // Patch MP3 link
-  formatGrid.querySelectorAll('.format-btn').forEach((btn, i) => {
-    if (formats[i].type === 'audio') {
-      btn.href = `https://api.vevioz.com/@api/button/mp3/${videoId}`;
-    }
+  formatGrid.querySelectorAll('.format-btn').forEach(btn => {
+    btn.addEventListener('click', handleFormatClick);
   });
 }
 
+// ── Main handler ──
 snapBtn.addEventListener('click', handleSnap);
 urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleSnap(); });
 
@@ -982,31 +1089,34 @@ async function handleSnap() {
   if (!raw) { setStatus('⚠️ Please paste a YouTube video URL first.', 'error'); return; }
 
   const videoId = extractVideoId(raw);
-  if (!videoId) { setStatus('⚠️ That doesn\'t look like a valid YouTube URL. Please try again.', 'error'); return; }
+  if (!videoId) {
+    setStatus('⚠️ Invalid YouTube URL. Supports youtube.com/watch, youtu.be, and YouTube Shorts.', 'error');
+    return;
+  }
 
   showLoading(true);
-  setStatus('🔍 Fetching video information…', 'loading');
+  setStatus('🔍 Fetching video info…', 'loading');
   resultBox.classList.remove('show');
 
   try {
-    // Fetch video metadata from noembed (a free, public oEmbed provider)
-    const res = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
+    // noembed gives us the title + channel name (lightweight, no API key)
+    const res  = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
     const data = await res.json();
 
-    if (!data || data.error) throw new Error('Could not retrieve video info.');
+    if (!data || data.error) throw new Error('noembed error');
 
-    document.getElementById('resultThumb').src  = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
-    document.getElementById('resultTitle').textContent   = data.title || 'Unknown Title';
+    document.getElementById('resultThumb').src = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
+    document.getElementById('resultTitle').textContent   = data.title || 'YouTube Video';
     document.getElementById('resultChannel').textContent = '📺 ' + (data.author_name || 'Unknown Channel');
-    document.getElementById('resultDuration').textContent= '⏱ Click a format below to start downloading';
+    document.getElementById('resultDuration').textContent= '⏱ Choose a format below — download starts immediately';
 
-    renderFormats(videoId, data.title);
-    setStatus('✅ Video found! Choose a format to download.', '');
+    renderFormats(videoId);
+    setStatus('✅ Video found! Click a format button to download.', '');
     resultBox.classList.add('show');
     resultBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
   } catch (err) {
-    setStatus('❌ Could not fetch video info. Please check the URL and try again.', 'error');
+    setStatus('❌ Could not load video info. Please check the URL and try again.', 'error');
   } finally {
     showLoading(false);
   }
